@@ -8,7 +8,7 @@ import matplotlib.pyplot as plt
 excluded_words = [""]
 
 def relate(event_titles: list[str]):
-    embeddings = embed_texts(event_titles, n_threads=1) # (N, D) array
+    embeddings = embed_texts(event_titles) # (N, D) array
     relation = embeddings @ embeddings.T  # (N, N) array
     return relation
 

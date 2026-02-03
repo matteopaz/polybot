@@ -6,11 +6,10 @@ import requests
 from concurrent.futures import ThreadPoolExecutor
 import numpy as np
 
-try:
-    from dotenv import load_dotenv
-    load_dotenv()
-except ImportError:
-    pass
+from dotenv import load_dotenv
+from joblib import Parallel, delayed
+load_dotenv()
+API_KEY = os.getenv("OPENROUTER_API_KEY")
 
 EMBEDDING_MODEL = "qwen/qwen3-embedding-8b"
 CACHE_FILE = os.path.join(os.path.dirname(os.path.dirname(__file__)), "data/embeddings_cache.pkl")
@@ -20,69 +19,61 @@ if os.path.exists(CACHE_FILE):
     try:
         with open(CACHE_FILE, "rb") as f:
             _cache = pickle.load(f)
+    except EOFError:
+        _cache = {}
     except Exception as e:
         print(f"Warning: Could not load cache: {e}")
 
 def save_cache():
     try:
-        with open(CACHE_FILE, "wb") as f:
+        os.makedirs(os.path.dirname(CACHE_FILE), exist_ok=True)
+        temp_file = CACHE_FILE + ".tmp"
+        with open(temp_file, "wb") as f:
             pickle.dump(_cache, f)
+        os.replace(temp_file, CACHE_FILE)
     except Exception as e:
         print(f"Warning: Could not save cache: {e}")
 
 atexit.register(save_cache)
 
-def embed_text(text: str) -> np.ndarray:
-    key = text.strip().lower()
-    if key in _cache:
-        return _cache[key]
+def embed_text_batch(texts: list[str]) -> np.ndarray | None:
+    keys = [text.strip().lower() for text in texts]
+    embs = [_cache[key] if key in _cache else None for key in keys]
 
-    print(f"Embedding: {key[:50]}...")
-    api_key = os.getenv("OPENROUTER_API_KEY")
+    try:
+        response = requests.post(
+            "https://openrouter.ai/api/v1/embeddings",
+            headers={
+                "Authorization": f"Bearer {API_KEY}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "model": EMBEDDING_MODEL,
+                "input": keys
+            }
+        )
     
-    max_retries = 3
-    for attempt in range(max_retries):
-        try:
-            response = requests.post(
-                "https://openrouter.ai/api/v1/embeddings",
-                headers={
-                    "Authorization": f"Bearer {api_key}",
-                    "Content-Type": "application/json",
-                },
-                json={
-                    "model": EMBEDDING_MODEL,
-                    "input": key
-                }
-            )
-            
-            if response.status_code != 200:
-                print(f"Error embedding text (attempt {attempt+1}): {response.text}")
-                if attempt == max_retries - 1:
-                    response.raise_for_status()
-                time.sleep(1)
-                continue
+        data = response.json()
+        embeddings = [item["embedding"] for item in data["data"]]
 
-            data = response.json()
-            embedding = data["data"][0]["embedding"]
+        result = np.array(embeddings)
+        for key, emb in zip(keys, result):
+            _cache[key] = emb
+        
+        return result
+        
+    except (requests.exceptions.ChunkedEncodingError, requests.exceptions.ConnectionError, requests.exceptions.Timeout) as e:
+        print(f"Network error: {e}")
 
-            result = np.array(embedding).reshape(1, len(embedding))
-            _cache[key] = result
-            return result
-            
-        except (requests.exceptions.ChunkedEncodingError, requests.exceptions.ConnectionError) as e:
-            print(f"Network error (attempt {attempt+1}): {e}")
-            if attempt == max_retries - 1:
-                raise
-            time.sleep(1 * (attempt + 1))
-
-def embed_texts(texts: list[str], n_threads=16) -> np.ndarray:
-    if not texts:
+def embed_texts(texts: list[str], chunksize=256) -> np.ndarray:
+    batches = [texts[i : i + chunksize] for i in range(0, len(texts), chunksize)]
+    results = Parallel(n_jobs=4, prefer="threads")(
+        delayed(embed_text_batch)(batch) for batch in batches
+    )
+    
+    # Filter out Nones in case of failures and concierge results
+    valid_results = [res for res in results if res is not None]
+    if not valid_results:
         return np.array([])
-
-    with ThreadPoolExecutor(max_workers=n_threads) as executor:
-        results = list(executor.map(embed_text, texts))
-
-    if not results:
-         return np.array([])
-         
-    return np.vstack(results)
+        
+    return np.vstack(valid_results)
